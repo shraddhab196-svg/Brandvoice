@@ -184,7 +184,8 @@ def test_single_post_doesnt_make_an_evidence_backed_trait(monkeypatch):
     fake = install_fake_groq(monkeypatch)
     fake.analysis = analysis
     traits = post_generate(make_settings(), SCHOOLS_REQ).json()["voice_profile"]["traits"]
-    assert traits[1]["basis"] == "inferred" and len(traits[1]["evidence"]) == 1  # one outage notice: shown, not trusted
+    # An outage notice is support boilerplate: filtered out of the evidence entirely, so it can't back a trait at all.
+    assert traits[1]["basis"] == "inferred" and traits[1]["evidence"] == []
     assert traits[0]["basis"] == "evidence"  # two different posts
 
 

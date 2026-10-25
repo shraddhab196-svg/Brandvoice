@@ -45,18 +45,20 @@ def generate(req: TweetRequest, settings: Settings = Depends(get_settings)) -> T
     if settings.missing_groq_stages:  # name exactly which stage's key is missing
         raise HTTPException(status_code=503, detail=missing_groq_key_message(settings.missing_groq_stages))
 
-    if not req.brand_name and req.voice_preferences is None:
+    # The user's own example tweets are voice evidence: with them, there's no need to ask how to sound.
+    has_examples = bool(req.example_tweets)
+    if not req.brand_name and req.voice_preferences is None and not has_examples:
         raise _needs_voice_input(req, settings, None)  # no brand: no research at all, so ask how to sound
 
     research = gather_research(req, settings)  # 1. research (best-effort, credit-guarded; skipped without a brand)
     # Fallback only applies when research actually looked for the brand (not when it's unconfigured or skipped).
     looked = bool(req.brand_name) and not research.skipped_reason
-    if looked and not research.posts and req.voice_preferences is None:
+    if looked and not research.posts and req.voice_preferences is None and not has_examples:
         raise _needs_voice_input(req, settings, research)  # no posts at all: ask before spending a Groq call
     try:
         profile, review = analyze_voice(req, settings, research)  # 2. voice analysis + source review
         has_voice = any(s.kind == "x_posts" and s.id in review.accepted for s in research.sources())
-        if looked and not has_voice and req.voice_preferences is None:
+        if looked and not has_voice and req.voice_preferences is None and not has_examples:
             raise _needs_voice_input(req, settings, research)  # posts existed but weren't the brand's own
         tweets = write_tweets(req, settings, profile, research, review)  # 3. content that applies it
     except LLMError as exc:
@@ -65,6 +67,8 @@ def generate(req: TweetRequest, settings: Settings = Depends(get_settings)) -> T
     report = research.report(review)
     if has_voice:
         voice_source = "research"
+    elif has_examples:
+        voice_source = "user_examples"
     elif req.voice_preferences is not None:
         voice_source = "user_preferences"
         report.message = _from_answers(report.message)

@@ -9,19 +9,21 @@ must point at sources that were actually retrieved. Anything else is labelled "i
 """
 
 import json
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 import logging
 import re
+import time
 from functools import lru_cache
 
 import groq
 from pydantic import ValidationError
 
 from app.config import GROQ_STAGES, Settings, missing_groq_key_message
-from app.research import (EMOJI_RE, ResearchResult, Review, Source, _sanitize, _stem, _terms, canonical_text,
-                          observed_style)
-from app.schemas import (MAX_TWEET_CHARS, TWEET_COUNT, SourceInsight, Tweet, TweetRequest, VoicePreferences,
-                         VoiceProfile)
+from app.research import (EMOJI_RE, MAX_POSTS, MIN_STYLE_POSTS, ResearchResult, Review, Source, _sanitize, _stem,
+                          _terms, canonical_text, observed_style)
+from app.schemas import (MAX_EXAMPLE_TWEETS, MAX_TWEET_CHARS, TWEET_COUNT, SourceInsight, Tweet, TweetRequest,
+                         VoicePreferences, VoiceProfile)
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +64,8 @@ NEAR_DUPLICATE_OVERLAP = 0.8
 MIN_EVIDENCE_POSTS = 2  # a trait/pattern/theme needs this many different posts to count as evidence-backed
 MAX_EVIDENCE_QUOTES = 3
 SHORT_POST_WORDS = 15
-MAX_VOICE_EXAMPLES = 8
+MAX_VOICE_EXAMPLES = MAX_POSTS + MAX_EXAMPLE_TWEETS  # every kept post and every user example reach generation
+EXAMPLES_ID = "EX"  # evidence quotes from the user's own example tweets cite this ID
 MAX_PRODUCT_EVIDENCE_CHARS = 1500
 MAX_QUOTE_CHARS = 200
 MIN_QUOTE_CHARS = 8
@@ -86,8 +89,11 @@ few none one another our your their his her its my we you they it he she let let
 if then because while after before since until once even only maybe perhaps meet try get make take grab start stop say
 tell ask imagine picture remember same less more no yes good great""".split())
 # "<Name> <verb> <the/a/her...>": a named person doing something, e.g. "Priya closes the ward".
+# "Name + verb + …" ("Priya switched to…"). A pronoun is never the verb: imperative CTAs like "Tag us with…",
+# "Show us your…", "Send me…" are not stories (the old "[a-z]+s" alternative matched "us").
 STORY_SUBJECT_RE = re.compile(
-    r"[A-Z][a-z]{2,}\s+(?:[a-z]+s|[a-z]+ed|was|is|has|had|just|finally|never|always|used)\s+"
+    r"[A-Z][a-z]{2,}\s+(?!(?:us|me|them|you|this|his|its|yours|ours|hers|theirs)\b)"
+    r"(?:[a-z]+s|[a-z]+ed|was|is|has|had|just|finally|never|always|used)\s+"
     r"(?:the|a|an|her|his|their|my|our|your|up|out|in|at|on|to|with|every|each|this|that|it|him|them|for|from|into|off|down|over)\b")
 ANECDOTE_RE = re.compile(
     r"\b(?:one of our|our|a|an)\s+(?:customers?|users?|clients?|members?|subscribers?|readers?|fans?)\s+"
@@ -104,7 +110,64 @@ OFFER_PHRASES = {
     "money-back": ("money-back", "refund"), "lifetime deal": ("lifetime",),
 }
 SUPERLATIVES = ("#1", "number one", "award-winning", "world's first", "best-selling", "bestselling", "industry-leading",
-                "most popular", "fastest", "trusted by", "the only ")
+                "most popular", "fastest", "trusted by")
+# "the only" is a claim only about the product ("the only app that…"), not in figurative lines ("you're the only one").
+ONLY_CLAIM_RE = re.compile(r"\bthe only (?:app|tool|platform|product|service|brand|company|solution|course|"
+                           r"program|one that)\b", re.IGNORECASE)
+# "the only way/place" is a claim only when the clause is about the brand ("Acme is the only way to…"), not in
+# figurative or third-party lines ("it's a myth that calendars are the only way…").
+ONLY_WAY_RE = re.compile(r"\bthe only (?:way|place)\b", re.IGNORECASE)
+# Reflective first-person openings ("we notice…", "we often ask…", "we wonder…"): observations, not company claims.
+# Any outcome, statistic or evidence claim inside them is still caught by the rules below.
+REFLECTIVE_RE = re.compile(r"^\W*(?:we|i)(?:'re|'ve| are| have)?\s+(?:often\s+|sometimes\s+|always\s+|still\s+|just\s+|"
+                           r"really\s+|keep\s+)?(?:ask|asked|asking|wonder\w*|notice\w*|hear|heard|feel|felt|see|saw|"
+                           r"think\w*|thought|believe|love|hope|imagine|remember|know|miss|like)\b", re.IGNORECASE)
+# Product performance and wear claims without numbers ("lasts all day", "smudge-proof", "just one coat", "zero clumps",
+# "long-lasting", "cruelty-free"): fine only when the brief or official product evidence states the same thing.
+PERFORMANCE_CLAIM_RE = re.compile(
+    r"\b(?:(?:lasts?|lasting|wears?|stays?|holds?)\s+(?:all\s+(?:day|night)|for\s+hours|(?:day|night)\s+long|"
+    r"round the clock)|all[- ](?:day|night)\s+(?:wear|hold|lift|volume|length|coverage|comfort|staying power)|"
+    r"long[- ](?:lasting|wearing)|(?:smudge|water|sweat|transfer|budge|flake|clump|crease|humidity|tear|smear)"
+    r"[- ]?(?:proof|resistant)|(?:won'?t|doesn'?t|never)\s+(?:budge|smudge|flake|clump|smear|fade|crease|run)|"
+    r"(?:zero|no)\s+(?:clumps?|flakes?|flaking|smudg\w*|smear\w*|creas\w*|transfer|fallout)|"
+    r"(?:one|a single|just one)\s+(?:coat|swipe|stroke|layer|application|pump)s?|"
+    r"(?:dermatologist|ophthalmologist|clinically|allergy)[- ]tested|hypoallergenic|"
+    r"(?:cruelty|fragrance|paraben|sulfate|gluten|sugar|dairy|bpa)[- ]free)\b", re.IGNORECASE)
+# Outcome, performance and evidence claims, whatever the subject: supported only if the evidence states the same.
+OUTCOME_NOUNS = (r"(?:retention|focus|productivity|performance|results?|scores?|grades?|sales|revenue|conversions?|"
+                 r"engagement|output|efficiency|memory|recall|fluency|accuracy|speed|motivation|consistency|outcomes?)")
+OUTCOME_CLAIMS = [
+    (re.compile(r"\b(?:boost(?:s|ed)?|improv(?:e|es|ed|ing)|increas(?:e|es|ed)|doubl(?:e|es|ed)|tripl(?:e|es|ed)|"
+                r"cuts?|reduc(?:e|es|ed)|lowers?|raises?|maximi[sz]es?|enhanc(?:e|es|ed))\s+(?:your\s+|the\s+|their\s+)?"
+                rf"(?:\w+\s+){{0,2}}?{OUTCOME_NOUNS}\b", re.IGNORECASE),
+     "Outcome claim not in your brief or product evidence"),
+    (re.compile(rf"\b(?:higher|better|more|greater|faster|stronger|lower|fewer)\s+(?:\w+\s+){{0,2}}?{OUTCOME_NOUNS}\b"
+                r"|\b(?:\d+(?:\.\d+)?x|twice|three times|\d+ times)\s+(?:as\s+)?(?:\w+\s+)?(?:as|than)\b",
+                re.IGNORECASE),
+     "Performance comparison not in your brief or product evidence"),
+    (re.compile(r"\b(?:studies|study|research|science|data|surveys?|experts?|scientists?)\s+(?:show|shows|showed|"
+                r"prove|proves|proved|suggest|suggests|says?|found|finds|agree)\b|\b(?:proven|clinically|scientifically)\b"
+                r"|\b(?:users|customers|learners|teams|students|people|workers|members|readers|clients)\b"
+                r"(?:\s+\S+){0,8}?\s+report\b", re.IGNORECASE),
+     "Evidence claim not in your brief or product evidence"),
+]
+# Offer, discount, guarantee and launch-date wording: review triggers (not rejections), fine whenever the grounding
+# (brief + official product evidence) mentions the same kind of thing. (pattern, review label, grounding keywords)
+PROMO_CLAIMS = [
+    (re.compile(r"\b(?:for free|(?:it'?s|is|are|totally|completely|always) free|100% free|free (?:app|plan|trial|"
+                r"shipping|delivery|lessons?|access|version|tier|account|month|week|download|gift|sample)s?)\b",
+                re.IGNORECASE), "Free offer not in your brief or product evidence", ("free",)),
+    (re.compile(r"\b(?:\d+\s*%\s*off|half off|discount(?:ed|s)?|on sale|sale ends|flash sale|coupons?|bogo|"
+                r"buy one,? get one)\b", re.IGNORECASE),
+     "Discount or sale not in your brief or product evidence", ("discount", " off", "sale", "coupon", "bogo")),
+    (re.compile(r"\b(?:guarantee[ds]?|risk[- ]free|no[- ]risk)\b", re.IGNORECASE),
+     "Guarantee not in your brief or product evidence", ("guarantee", "risk-free", "risk free", "refund")),
+    # The date itself must be in the grounding: a brief that says "launch" doesn't support "launches tomorrow".
+    (re.compile(r"\b(?:launch(?:es|ing|ed)?|drops?|dropping|available|arrives?|arriving|out|live)\s+(?P<when>today|"
+                r"tomorrow|tonight|this (?:week|weekend|month)|next (?:week|month)|on (?:mon|tues|wednes|thurs|fri|"
+                r"satur|sun)day|soon)\b", re.IGNORECASE),
+     "Launch or availability date not in your brief or product evidence", None),
+]
 CAPABILITY_RE = re.compile(r"\b(?:lets you|let you|can now|now [a-z]+s\b|automatically|instantly|in one click|in seconds|"
                            r"comes with|built[- ]in|supports|includes|powered by)", re.IGNORECASE)
 # Hashtags, @mentions and URLs are style/navigation, not claims ("#ARFuture" must not flag "Future").
@@ -188,6 +251,8 @@ EVIDENCE RULES (critical)
 - Each quote must come from a single post, with the same capitalisation and wording.
 - If no X post supports an item, use an empty evidence list; it will be shown as inferred.
 - If there is no <brand_research>, every evidence list must be empty and source_insights must be [].
+- <example_tweets> (when present) are the user's own real tweets for this brand: voice evidence like X posts (quote
+  them exactly, with source_id "EX"), never product facts.
 
 CONFIDENCE (critical)
 - A trait or writing pattern must hold across SEVERAL posts. Give at least 2 quotes from different posts; one post
@@ -199,10 +264,20 @@ CONFIDENCE (critical)
 - <observed_style> (when present) lists measured mechanics of the posts: casing, length, hashtags, emoji,
   punctuation. Describe the patterns it supports (also slang, humour and recurring formats you can see in the posts).
 - themes: topics that recur across at least 2 posts, or that the brief itself is about.
+- The posts are only the brand's most recent X posts (at most 15). If most belong to one campaign, season, launch or
+  collaboration, describe what is specific to it as such ("in its current holiday posts"), not as the brand's
+  permanent voice; core traits must hold across posts on different topics.
+- This is the brand's voice on X: name X-specific habits (lowercase, memes, replies, threads) as platform style,
+  separate from the core personality, which can carry across platforms.
+- A trait or pattern taken from the brief, not seen in the posts, must say so in its description ("suggested by the
+  brief"); never present it as observed.
 - <voice_preferences> (when present) is the user's own choice of writing style, given because none of the brand's posts
   could be used. If <brand_research> has no X posts you accept as the brand's own, base tone, traits and
   writing_patterns on it and on the brief, with empty evidence lists, and never describe it as the brand's observed or
   researched voice. If it does have the brand's own posts, they take precedence.
+- With no X posts you accept and no <example_tweets>, there is no evidence of how this brand writes: describe a
+  suggested voice that fits the brief, say in the summary that it is suggested, and never invent brand history,
+  mascots, catchphrases or personality traits as if they were known.
 SOURCE IDENTITY (critical)
 - source_relevance: one entry per source: relevant=true if it is this brand's official account or site (the company in
   the brief), whatever topics it covers. relevant=false only for a different company or person with a similar name,
@@ -271,6 +346,10 @@ VOICE (most important)
 - Imitate the observed writing mechanics of <voice_examples>: casing, sentence length, punctuation, slang, humour,
   formatting, emoji and hashtag habits. <observed_style> gives measured mechanics and rules: follow them.
 - Write NEW lines in that style. Never copy or lightly edit an example post, and never take its topic or facts.
+- <voice_examples> may include the user's own example tweets: learn tone, vocabulary, sentence length, humour,
+  punctuation, emoji and formatting from them, never their wording.
+- voice_confidence in <voice_profile> says how much evidence there is of how this brand writes: "none" or "low" means
+  the profile is a suggestion; stay close to the brief and don't exaggerate its traits.
 - Without <voice_examples>, follow <voice_preferences> (the user's own choices, when present) and <voice_profile>,
   and still write like a person, not a brochure.
 - Don't swap the voice for generic marketing: no brochure feature lists, no corporate phrasing, no explaining the joke,
@@ -283,7 +362,13 @@ CAMPAIGN AND FACTS
   brand writes; never take products, features or campaign topics from them.
 - Never invent facts: no made-up numbers, statistics, timings, prices, dates, outcomes, customer stories, named
   people, behind-the-scenes activity or product capabilities. Jokes, opinions and obvious exaggeration are fine.
+- Product performance (how long it lasts, waterproof or smudge-proof, how many coats or uses, results) only when
+  <brand_input> or <product_evidence> states it.
 - Never mention events, conferences, workshops, booths or appearances unless <brand_input> mentions them.
+- Discounts, percentages, "free", "% off", sales, guarantees and launch or availability dates appear only when
+  <brand_input> or <product_evidence> states them; otherwise leave them out (never swap in a different made-up one).
+- Every tweet uses at least one specific, relevant detail from <brand_input> or <product_evidence> (a feature,
+  audience, benefit or the campaign goal). Never invent a detail to sound specific.
 
 CONTENT STYLE AND FORMAT (two separate labels)
 - content_style is what the tweet does for the reader, one of:
@@ -304,11 +389,16 @@ CANDIDATES
 - Never open with templates like "Tip:", "Pro tip", "Spotlight", "Myth:", "Fact:", "Picture this", "Imagine",
   "Ever wonder", "Did you know", "Introducing", "Attention" or "Behind the scenes".
 - Each candidate is a genuinely different idea: no two share an opening, a joke or a premise.
+- Vary hooks, sentence structures and CTAs: no more than two tweets may start with the same word, and don't build
+  every tweet around one slogan, pun or catchphrase (including the brand's own tagline).
 - Use the brand name only when it helps: at most once per tweet, in no more than a third of the tweets.
 - "thread opener" ends with a complete thread cue ("🧵" or "1/"); "direct CTA" says exactly what to do.
 - Under 260 characters (hard limit {MAX_TWEET_CHARS}).
 - Avoid AI cliches: "unlock", "elevate", "game-changer", "revolutionize", "dive in", "look no further", "in today's
   fast-paced world", "take it to the next level".
+- No generic filler: "discover the magic of", "experience the power of", "embark on a journey", "like never before",
+  "say goodbye to", "the wait is over", "one-stop shop", "whether you're a ... or a ...".
+- Don't repeat a hook, CTA or phrase across candidates (e.g. the same "do X now" ending in several tweets).
 
 REASONING FOR EACH TWEET
 - traits: 1-3 trait names it applies, copied exactly from <voice_profile>.
@@ -328,11 +418,65 @@ Respond with ONLY a JSON object of this shape:
   "claims": [{{"claim": "...", "support": "brief", "quote": "..."}}], "rationale": "..."}}]}}"""
 
 
+# Repair (regeneration) call: replaces only rejected or missing tweets. Deliberately compact (no full generation prompt,
+# research insights or full evidence) so it fits the free tier's tokens-per-minute budget after the first generation.
+REPAIR_MAX_TOKENS = 4096  # the first generation call keeps its larger budget; a repair writes few tweets
+REPAIR_MAX_EXAMPLES = 5
+REPAIR_MAX_EVIDENCE_CHARS = 800
+REPAIR_MAX_WAIT_SECONDS = 15.0  # wait for Groq's Retry-After at most this long, once; longer limits aren't waited out
+REPAIR_PROMPT = f"""You repair a brand's set of tweets: write the replacement tweets requested in <task>, in the
+brand's voice.
+
+RULES
+- Sound like <voice> and <voice_examples> (when present): same casing, length, punctuation, slang, humour, emoji and
+  hashtag habits. Learn the style; never copy an example.
+- Each tweet serves the campaign objective in <brand_input> and uses a specific detail from <brand_input> or
+  <product_evidence>.
+- Product facts, offers, prices, numbers, percentages, "free", discounts, guarantees and dates may come only from
+  <brand_input> or <product_evidence>. Never repeat a detail listed in <rejected_candidates>, and never swap in another
+  unsupported one. Jokes and opinions are fine.
+- Each new tweet differs from <already_written> and from the others in idea, opening and CTA. No generic filler or
+  template openers ("Tip:", "Did you know", "Picture this", "Discover the magic of").
+- Counting <already_written>, no more than two tweets may start with the same word; don't lean on one slogan or
+  catchphrase.
+- Product performance (how long it lasts, waterproof or smudge-proof, how many coats or uses, results) only when
+  <brand_input> or <product_evidence> states it.
+- Under 260 characters (hard limit {MAX_TWEET_CHARS}).
+- content_style: one of {", ".join(CONTENT_STYLES)} (prefer those named in <task>). style (the format): one of
+  {", ".join(TWEET_STYLES)}. Never write either label in the tweet.
+- traits: 1-3 names copied from <voice>. insight_ids: []. claims: every factual statement, with support "brief" and a
+  quote copied exactly from <brand_input>, or a <product_evidence> ID and a quote copied exactly from it.
+- rationale: one sentence.
+
+{INPUT_RULES}
+
+Respond with ONLY a JSON object of this shape:
+{{"tweets": [{{"content_style": "witty", "style": "question", "text": "...", "traits": ["..."], "insight_ids": [],
+  "claims": [{{"claim": "...", "support": "brief", "quote": "..."}}], "rationale": "..."}}]}}"""
+_sleep = time.sleep  # indirection so tests never really wait
+
+
 class LLMError(Exception):
-    def __init__(self, status_code: int, message: str):
+    def __init__(self, status_code: int, message: str, retry_after: float | None = None):
         super().__init__(message)
         self.status_code = status_code
         self.message = message
+        self.retry_after = retry_after  # seconds Groq asked us to wait (rate limits only), if it said
+
+
+RETRY_AFTER_TEXT_RE = re.compile(r"try again in ([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE)
+
+
+def _retry_after(exc: groq.RateLimitError) -> float | None:
+    """Groq's wait hint on a 429: the Retry-After header, else the "Please try again in 6.3s" in its error message."""
+    header = exc.response.headers.get("retry-after") if exc.response is not None else None
+    try:
+        if header is not None:
+            return float(header)
+    except ValueError:
+        pass
+    m = RETRY_AFTER_TEXT_RE.search(str(exc.body) if exc.body else str(exc))
+    return float(m.group(1)) if m else None
 
 
 @lru_cache
@@ -398,8 +542,8 @@ def _complete(settings: Settings, stage: str, system: str, user: str, *, tempera
         )
     except groq.AuthenticationError:
         raise LLMError(502, f"Groq rejected {env_name} (used for {stage_name}). Check the key in backend/.env.")
-    except groq.RateLimitError:
-        raise LLMError(429, "Groq rate limit reached. Please wait a moment and try again.")
+    except groq.RateLimitError as exc:
+        raise LLMError(429, "Groq rate limit reached. Please wait a moment and try again.", _retry_after(exc))
     except groq.APITimeoutError:
         raise LLMError(504, "Groq took too long to respond. Please try again.")
     except groq.APIConnectionError:
@@ -640,10 +784,23 @@ def _repair_fields(user: str, settings: Settings, fields: dict, bad: list[str], 
     return _profile_fields(_load_json(content, "analysis field repair"), voice_segments, voice_posts, brief_text, bad)
 
 
+def _voice_confidence(voice_posts: list[str], profile: VoiceProfile) -> str:
+    """Computed from evidence, never model-reported: "none" = no brand writing (a suggested voice); "high" = at least
+    MIN_STYLE_POSTS posts/examples and 2+ evidence-backed traits; "low" = anything in between."""
+    if not voice_posts:
+        return "none"
+    backed = sum(t.basis == "evidence" for t in profile.traits)
+    return "high" if len(voice_posts) >= MIN_STYLE_POSTS and backed >= MIN_EVIDENCE_POSTS else "low"
+
+
 def analyze_voice(req: TweetRequest, settings: Settings, research: ResearchResult | None) -> tuple[VoiceProfile, Review]:
     sources = research.sources() if research else []
     user = build_user_prompt(req, research.to_prompt() if research else None) + preferences_block(req.voice_preferences)
-    style = observed_style(research.posts) if research and research.posts else None
+    examples = req.example_tweets or []
+    if examples:  # the user's own tweets: voice evidence (quotable as "EX"), never product facts
+        user += (f"\n\n<example_tweets>\n[{EXAMPLES_ID}] The user's own real tweets for this brand (voice evidence, not "
+                 "product facts)\n" + "\n".join(f"- {_sanitize(x)}" for x in examples) + "\n</example_tweets>")
+    style = observed_style([*(research.posts if research else []), *examples]) or None
     if style:
         user += f"\n\n<observed_style>\n{json.dumps(style)}\n</observed_style>"
     content = _complete(settings, "analysis", ANALYSIS_PROMPT, user, temperature=0.4, max_tokens=4096)
@@ -655,8 +812,10 @@ def analyze_voice(req: TweetRequest, settings: Settings, research: ResearchResul
     # ...but voice traits and writing patterns may only be evidenced by the brand's own X posts, never website copy.
     voice_segments = {sid: segs for sid, segs in segments.items()
                       if next(s.kind for s in sources if s.id == sid) == "x_posts"}
+    if examples:
+        voice_segments[EXAMPLES_ID] = [canonical_text(x) for x in examples]
 
-    voice_posts = [g for s in sources if s.id in accepted and s.kind == "x_posts" for g in s.segments]
+    voice_posts = [g for s in sources if s.id in accepted and s.kind == "x_posts" for g in s.segments] + examples
     brief_text = "\n".join(filter(None, [req.industry, req.campaign_objective, req.description]))
     fields = _profile_fields(data, voice_segments, voice_posts, brief_text)
     try:
@@ -680,6 +839,7 @@ def analyze_voice(req: TweetRequest, settings: Settings, research: ResearchResul
             profile = VoiceProfile.model_validate(fields)
         except ValidationError as retry_exc:
             raise _invalid(stage, retry_exc)
+    profile = profile.model_copy(update={"voice_confidence": _voice_confidence(voice_posts, profile)})
 
     insights = _review_insights(data, sources, accepted, segments)
     quotes: dict[str, list[str]] = {}
@@ -754,6 +914,7 @@ def build_generation_prompt(req: TweetRequest, profile: VoiceProfile, findings: 
         # Labelled so research-derived themes shape style, never the campaign topic or product facts.
         "voice_themes (style context only; not campaign topics or product facts)": profile.themes,
         "avoid": profile.avoid,
+        "voice_confidence": profile.voice_confidence,  # "none"/"low": the profile is a suggestion, not observed
     }
     prompt += f"\n\n<voice_profile>\n{json.dumps(profile_view, ensure_ascii=False)}\n</voice_profile>"
     if findings:
@@ -877,6 +1038,20 @@ def unverified_details(tweet_text: str, grounding: str, brand: str | None = None
     for phrase in SUPERLATIVES:  # checked on the unmasked text: "#1" is a claim even though it looks like a hashtag
         if phrase in text.lower() and phrase not in ground_lower:
             found.append(_flag("Superlative claim not in your brief", phrase.strip()))
+    only = ONLY_CLAIM_RE.search(masked)
+    if only and "the only" not in ground_lower:
+        found.append(_flag("Superlative claim not in your brief", only.group(0)))
+    for pattern, label, keys in PROMO_CLAIMS:
+        for m in pattern.finditer(masked):
+            supported = (m.group("when").lower() in ground_lower if keys is None
+                         else any(k in ground_lower for k in keys))
+            if not supported:
+                found.append(_flag(label, m.group(0)))
+    for m in PERFORMANCE_CLAIM_RE.finditer(masked):
+        claim = m.group(0)
+        # Supported when the evidence has the same wording ("smudge-proof") or the same content words ("lasts all day").
+        if canonical_text(claim).lower() not in ground_lower and not (_terms(claim) and _terms(claim) <= ground_terms):
+            found.append(_flag("Performance claim not in your brief or product evidence", claim))
     found.extend(feature_details(masked, grounding))
 
     for clause, original in _clauses(masked, text):
@@ -889,7 +1064,7 @@ def unverified_details(tweet_text: str, grounding: str, brand: str | None = None
             found.append(_flag("Event or appearance not in your brief", original))
             flagged_clauses.add(clause)
             continue
-        # Behind-the-scenes stories ("the team stayed up all night…", "the owl has been in meetings all week").
+        # Behind-the-scenes stories ("the team stayed up all night…", "the mascot has been in meetings all week").
         bts = BEHIND_SCENES_RE.search(clause)
         # A bare label ("Behind the scenes:") is a template issue, not a story: the story is what follows it.
         if bts and bts.group(0).lower() not in ground_lower and len(_terms(clause) - _terms(bts.group(0))) >= 2:
@@ -901,10 +1076,25 @@ def unverified_details(tweet_text: str, grounding: str, brand: str | None = None
             found.append(_flag("Capability not in your brief", original))
             flagged_clauses.add(clause)
             continue
+        # Outcome, performance and evidence claims, whatever the subject ("boosts retention", "report higher focus
+        # scores", "twice as fast as", "studies show"): supported only when the evidence states the same terms.
+        outcome = next(((m, label) for rx, label in OUTCOME_CLAIMS for m in [rx.search(clause)]
+                        if m and not _terms(m.group(0)) <= ground_terms), None)
+        if outcome:
+            found.append(_flag(outcome[1], original))
+            flagged_clauses.add(clause)
+            continue
+        # "the only way/place" only when the clause is about the brand or company.
+        if (ONLY_WAY_RE.search(clause) and "the only" not in ground_lower
+                and (_company_subject(clause, brand) or _brand_mentions(clause, brand))):
+            found.append(_flag("Superlative claim not in your brief", ONLY_WAY_RE.search(clause).group(0)))
+            flagged_clauses.add(clause)
+            continue
         # First-person company/product assertions: activities, performance, reliability ("We're always tweaking to
-        # keep AR smooth no matter the lighting"). Questions, wishes and thanks are not claims.
+        # keep AR smooth no matter the lighting"). Questions, wishes, thanks and reflective observations ("We often
+        # ask how…", "We notice…") are not claims.
         if (clause not in flagged_clauses and _company_subject(clause, brand) and not clause.endswith("?")
-                and not SENTIMENT_RE.search(clause) and uncovered):
+                and not SENTIMENT_RE.search(clause) and not REFLECTIVE_RE.match(clause) and uncovered):
             found.append(_flag("Company or product claim not in your brief", original))
     return list(dict.fromkeys(found))[:MAX_UNVERIFIED_DETAILS]
 
@@ -922,7 +1112,7 @@ def feature_details(masked: str, grounding: str) -> list[str]:
     """Product features stated in the tweet text itself ("earn points", "unlock badges", "comes with offline mode"),
     whether or not the model declared them as claims. A feature passes only if the words of what it offers are covered
     by the grounding (brief + official product evidence; never social posts), stem- and synonym-matched so paraphrases
-    ("earn XP" vs "earn points") pass. Figurative objects ("earn the owl's respect") and pronouns are not features."""
+    ("earn XP" vs "earn points") pass. Figurative objects ("earn the mascot's respect") and pronouns are not features."""
     ground = _expand_synonyms(_claim_words(grounding))
     found = []
     for m in FEATURE_RE.finditer(masked):
@@ -986,7 +1176,7 @@ def _check_claims(raw: object, brief: str, product: dict[str, str] | None = None
     A product claim is supported by a quote that appears verbatim (ignoring case) in the user's brief or in
     official-website product evidence (by its source ID), AND whose content words cover at least half of the claim's
     (stem-matched, so a paraphrase like "learning languages" vs "learn a language" still matches). A 2-word quote
-    ("daily streaks") must cover the whole claim, apart from its subject (the brand) and a generic verb ("offers").
+    ("daily reminders") must cover the whole claim, apart from its subject (the brand) and a generic verb ("offers").
     Social posts, research findings, unknown IDs and empty/unrelated quotes never support a product claim."""
     texts = {"brief": canonical_text(brief).lower(),
              **{sid: canonical_text(text).lower() for sid, text in (product or {}).items()}}
@@ -1052,17 +1242,35 @@ LIST_ITEM_RE = re.compile(r"(?m)^\s*(?:[-•*✅✔☑]|\d+[.)])\s+")
 THREAD_CUE_RE = re.compile(r"\N{SPOOL OF THREAD}|(?<![\w/])1/(?:\d+|n)?(?![\w/])")
 BROKEN_THREAD_RE = re.compile(r"\(\s*\d+\s*/\s*\)|\(\s*\d+\s*/\s*$|\(\s*\d+\s*/\s*\d*$")
 AI_CLICHE_RE = re.compile(r"\b(?:unlock\w*|elevate\w*|game[- ]changer|revolutioni[sz]e\w*|dive (?:in|into)|look no further|"
-                          r"fast-paced world|next level)\b", re.IGNORECASE)
+                          r"fast-paced world|next level|discover the (?:magic|power|joy|secret)s? of|"
+                          r"experience the (?:magic|power|joy) of|embark on (?:a|your) \w*\s*journey|like never before|"
+                          r"say goodbye to|the wait is over|one-stop shop|whether you'?re an? .{1,40}? or an? )\b",
+                          re.IGNORECASE)
 MIN_CONTENT_TERMS = 3
 SAME_IDEA_OVERLAP = 0.5
+MAX_SAME_FIRST_WORD = 2  # more tweets than this opening with the same word reads as a template ("Maybe… Maybe…")
+
+
+def _first_word(text: str) -> str:
+    words = re.findall(r"[a-z0-9']+", _mask(canonical_text(text), HASHTAG_MENTION_URL_RE).lower())
+    return words[0] if words else ""
 MAX_BRAND_TWEETS = -(-TWEET_COUNT // 3)  # brand name in at most a third of the batch
 
 
 @dataclass
 class QualityContext:
     brand: str | None
-    campaign_terms: set[str]
+    campaign_terms: set[str]  # brief (objective + description) + official product evidence: the "specific details"
     style: dict | None
+    examples: list[str] = field(default_factory=list)  # voice examples (brand posts + user's example tweets)
+    detail_phrases: set[str] = field(default_factory=set)  # product/brief details ("160 numbered pages"): reusable
+
+
+def _content_runs(text: str) -> set[str]:
+    """Runs of 2-3 consecutive content words in a text ("a5 dot grid", "numbered page"): its specific details.
+    Words are stemmed, so "notebooks" in the brief matches "notebook" in a tweet."""
+    words = [_stem(w) for w in re.findall(r"[a-z0-9']+", canonical_text(text).lower()) if w not in FUNCTION_WORDS]
+    return {" ".join(words[k:k + n]) for n in (2, 3) for k in range(len(words) - n + 1)}
 
 
 def _brand_mentions(text: str, brand: str | None) -> int:
@@ -1088,8 +1296,12 @@ def tweet_quality(text: str, approach: str, ctx: QualityContext) -> list[str]:
     content = _terms(masked) - _terms(ctx.brand or "")
     if len(content) < MIN_CONTENT_TERMS:
         issues.append(_flag("Too vague: says almost nothing specific", text))
-    elif not (content & ctx.campaign_terms) and not _brand_mentions(text, ctx.brand):
+    elif not (content & ctx.campaign_terms):  # a brand mention alone is not a specific detail
         issues.append(_flag("No clear link to the campaign or product", text))
+    copied = next((ex for ex in ctx.examples if _is_duplicate(text, ex)
+                   or (len(ex) >= 30 and canonical_text(ex).lower() in canonical_text(text).lower())), None)
+    if copied:
+        issues.append(_flag("Copies an example post instead of writing a new one", copied))
     if len(LIST_ITEM_RE.findall(text)) >= 2 or masked.count(",") >= 3:
         issues.append(_flag("Reads like a feature list", text))
     if BROKEN_THREAD_RE.search(text):
@@ -1119,19 +1331,47 @@ def tweet_quality(text: str, approach: str, ctx: QualityContext) -> list[str]:
 
 def _same_opening(a: list[str], b: list[str]) -> bool:
     """Repeated opening: the same first three words, or the same first two when both carry meaning ("ever wonder…",
-    "duolingo knows…"). A shared subject plus a filler word ("streaks are…", "your streak…") is not a repeat."""
+    "acme knows…"). A shared subject plus a filler word ("lessons are…", "your order…") is not a repeat."""
     if len(a) >= 3 and a[:3] == b[:3]:
         return True
     return len(a) >= 2 and a[:2] == b[:2] and not any(w in FUNCTION_WORDS for w in a[:2])
 
 
+def _key_phrases(text: str, brand_words: set[str], details: set[str] = frozenset()) -> set[str]:
+    """Three-word phrases carrying at least two content words ("restart your trial", "acme's weekly drop"): a
+    repeated one is a repeated hook or CTA. Shared single words and filler ("your order is") don't count, and neither
+    do the brief's own product details ("160 numbered pages", "a lay-flat"): tweets are meant to use those."""
+    words = re.findall(r"[a-z0-9']+", _mask(canonical_text(text), HASHTAG_MENTION_URL_RE).lower())
+    content = [w not in FUNCTION_WORDS and w.split("'")[0] not in brand_words and len(w) > 2 for w in words]
+    phrases = set()
+    for k in range(len(words) - 2):
+        if sum(content[k:k + 3]) < 2:
+            continue
+        core = [_stem(w) for w in words[k:k + 3] if w not in FUNCTION_WORDS]
+        # Unavoidable product/campaign terminology: the phrase contains one of the brief's own detail pairs
+        # ("dot grid notebook", "lay flat design", "a weekly review").
+        if not any(" ".join(core[j:j + 2]) in details for j in range(len(core) - 1)):
+            phrases.add(" ".join(words[k:k + 3]))
+    return phrases
+
+
 def _batch_quality(tweets: list[Tweet], ctx: QualityContext) -> list[Tweet]:
-    """Batch-level issues: repeated openings, repeated ideas, brand name in too many tweets."""
-    out, openings, ideas, brand_count = [], [], [], 0
+    """Batch-level issues: repeated openings, repeated ideas, repeated hooks/CTAs/phrases, brand name in too many
+    tweets."""
+    out, openings, ideas, phrases, brand_count = [], [], [], [], 0
     brand_terms = _terms(ctx.brand or "")
+    brand_words = set(re.findall(r"[a-z0-9]+", (ctx.brand or "").lower()))
     for i, t in enumerate(tweets):
         issues = list(t.quality_issues)
+        own = _key_phrases(t.text, brand_words, ctx.detail_phrases)
+        repeat = next(((j, p) for j, other in enumerate(phrases) for p in sorted(own & other)), None)
+        if repeat is not None:
+            issues.append(_flag(f"Repeats a phrase from tweet {repeat[0] + 1}", repeat[1]))
+        phrases.append(own)
         opening = re.findall(r"[a-z0-9']+", _mask(canonical_text(t.text), HASHTAG_MENTION_URL_RE).lower())[:3]
+        earlier = sum(1 for o in openings if opening and o and o[0] == opening[0])
+        if earlier >= MAX_SAME_FIRST_WORD:
+            issues.append(_flag(f"Starts with the same word as {earlier} earlier tweets", opening[0]))
         idea = _terms(_mask(canonical_text(t.text), HASHTAG_MENTION_URL_RE)) - brand_terms
         same_open = next((j for j, o in enumerate(openings) if _same_opening(opening, o)), None)
         if same_open is not None:
@@ -1202,6 +1442,55 @@ def _candidates(data: dict, req: TweetRequest, findings: dict, trait_names: dict
     return out
 
 
+def build_repair_prompt(req: TweetRequest, profile: VoiceProfile, examples: list[str], style: dict | None,
+                        product_sources: list[Source], kept: list[Tweet], flagged: list[dict], need: int,
+                        use_preferences: bool = False) -> str:
+    """The compact repair request: the brief (facts), the voice in brief (profile, style rules, a few examples),
+    trimmed product evidence, the tweets being kept (to stay distinct from) and the rejected ones with their reasons.
+    No full generation prompt, research insights or full evidence: it must fit what's left of the per-minute budget."""
+    voice = {"tone": profile.tone, "traits": [{"name": t.name, "description": t.description} for t in profile.traits],
+             "writing_patterns": [p.pattern for p in profile.writing_patterns], "avoid": profile.avoid,
+             "voice_confidence": profile.voice_confidence}
+    prompt = build_user_prompt(req) + f"\n\n<voice>\n{json.dumps(voice, ensure_ascii=False)}\n</voice>"
+    if examples:
+        prompt += ("\n\n<voice_examples>\n" + "\n".join(f"- {_sanitize(x)}" for x in examples[:REPAIR_MAX_EXAMPLES])
+                   + "\n</voice_examples>")
+    rules = style_rules(style)
+    if rules:
+        prompt += "\n\n<style_rules>\n" + "\n".join(f"- {r}" for r in rules) + "\n</style_rules>"
+    if use_preferences:
+        prompt += preferences_block(req.voice_preferences)
+    for src in product_sources:
+        prompt += (f"\n\n<product_evidence>\n[{src.id}] {src.name}\n"
+                   f"{_sanitize(src.text[:REPAIR_MAX_EVIDENCE_CHARS])}\n</product_evidence>")
+    prompt += f"\n\n<already_written>\n{json.dumps([t.text for t in kept], ensure_ascii=False)}\n</already_written>"
+    if flagged:
+        prompt += (f"\n\n<rejected_candidates>\n{json.dumps(flagged, ensure_ascii=False)}\n</rejected_candidates>")
+    counts = Counter(t.content_style for t in kept)
+    short = [s for s in CONTENT_STYLES if counts[s] < MIN_PER_CONTENT_STYLE]
+    prompt += (f"\n\n<task>\nWrite exactly {need} new tweets."
+               + (f" Prefer these content styles: {', '.join(short)}." if short else "") + "\n</task>")
+    return prompt
+
+
+def _repair_call(settings: Settings, prompt: str) -> dict:
+    """The single repair request (generation key). On a 429 it waits Groq's Retry-After once, only if that fits in
+    REPAIR_MAX_WAIT_SECONDS, then tries exactly once more; any other failure (or a second 429) is raised to the
+    caller, which keeps the original tweets with their flags visible."""
+    for attempt in (1, 2):
+        try:
+            return _load_json(_complete(settings, "generation", REPAIR_PROMPT, prompt, temperature=0.8,
+                                        max_tokens=REPAIR_MAX_TOKENS), "generation repair")
+        except LLMError as exc:
+            wait = exc.retry_after
+            if attempt == 1 and exc.status_code == 429 and wait is not None and wait <= REPAIR_MAX_WAIT_SECONDS:
+                logger.warning("Repair hit the rate limit; waiting %.1fs as Groq asked, then trying once more", wait)
+                _sleep(wait + 0.5)
+                continue
+            raise
+    raise AssertionError("unreachable")
+
+
 def write_tweets(req: TweetRequest, settings: Settings, profile: VoiceProfile, research: ResearchResult | None,
                  review: Review | None) -> list[Tweet]:
     all_sources = research.sources() if research else []
@@ -1213,33 +1502,44 @@ def write_tweets(req: TweetRequest, settings: Settings, profile: VoiceProfile, r
     grounding = _grounding_text(req, product_sources)
     product = {s.id: s.text for s in product_sources}
     brief = "\n".join(filter(None, [req.brand_name, req.industry, req.campaign_objective, req.description]))
-    examples = [post for s in x_sources for post in s.segments]
+    # Voice examples: the user's own example tweets (if any) plus the brand's accepted X posts. Style only, never facts.
+    examples = [*(req.example_tweets or []), *(post for s in x_sources for post in s.segments)]
     style = observed_style(examples)
-    ctx = QualityContext(brand=req.brand_name, style=style,
-                         campaign_terms=_terms(f"{req.campaign_objective} {req.description}") - _terms(req.brand_name or ""))
+    product_text = "\n".join(s.text for s in product_sources)
+    ctx = QualityContext(brand=req.brand_name, style=style, examples=examples,
+                         campaign_terms=_terms(f"{req.campaign_objective} {req.description} {product_text}")
+                         - _terms(req.brand_name or ""),
+                         # the user's own terminology: objective, description and official product evidence
+                         detail_phrases=_content_runs(f"{req.campaign_objective}\n{req.description}\n{product_text}"))
     trait_names = {t.name.lower(): t.name for t in profile.traits}
     prompt = build_generation_prompt(req, profile, findings, examples, style, product_sources)
     if not x_sources:  # fallback mode: the user's own answers (never presented as research) guide the voice
         prompt += preferences_block(req.voice_preferences)
     args = (req, findings, trait_names, brief, grounding, product, accepted, ctx)
     candidates = _candidates(_load_json(_complete(settings, "generation", GENERATION_PROMPT, prompt,
-                                                  temperature=0.8, max_tokens=6144), "generation"), *args)
+                                                  temperature=0.8, max_tokens=12288), "generation"), *args)
     usable = _distinct(candidates)
-    if len(usable) < TWEET_COUNT:
-        # One targeted top-up (generation key) when the model returned too few usable tweets; never more.
-        need = TWEET_COUNT - len(usable) + 2
-        logger.warning("Generation returned %d usable tweets (%d required); requesting %d more once",
-                       len(usable), TWEET_COUNT, need)
-        written = json.dumps([t.text for t in usable], ensure_ascii=False)
-        topup = (f"{prompt}\n\n<already_written>\n{written}\n</already_written>\nWrite exactly {need} NEW candidates "
-                 "that differ from <already_written> in idea and opening. Same rules and JSON shape.")
+    clean = [t for t in usable if not t.unverified_details]  # valid, distinct AND no unsupported claim
+    if len(clean) < TWEET_COUNT:
+        # One targeted regeneration (generation key), never more: valid, claim-free tweets are kept; only the missing
+        # or claim-flagged ones are replaced. Flagged tweets are listed so their unsupported details aren't repeated.
+        need = TWEET_COUNT - len(clean) + 1  # one spare, in case a replacement is itself rejected
+        flagged = [{"text": t.text, "unsupported": t.unverified_details} for t in usable if t.unverified_details]
+        logger.warning("Generation returned %d usable tweets, %d without unsupported claims (%d required); "
+                       "requesting %d replacements once", len(usable), len(clean), TWEET_COUNT, need)
+        repair = build_repair_prompt(req, profile, examples, style, product_sources, clean, flagged, need,
+                                     use_preferences=not x_sources)
         try:
-            more = _load_json(_complete(settings, "generation", GENERATION_PROMPT, topup, temperature=0.8,
-                                        max_tokens=6144), "generation top-up")
+            more = _repair_call(settings, repair)
         except LLMError as exc:
-            if exc.status_code != 502:  # provider errors (rate limit, auth, timeout) surface as before
+            if len(usable) >= TWEET_COUNT:  # 10 usable tweets exist: keep them (flags stay visible), don't fail
+                logger.warning("Regeneration failed (%s); keeping the original candidates with their review flags",
+                               exc.status_code)
+                more = {}
+            elif exc.status_code != 502:  # provider errors (rate limit, auth, timeout) surface as before
                 raise
-            more = {}
+            else:
+                more = {}
         candidates += _candidates(more, *args)
     return _select_tweets(candidates, ctx)
 
@@ -1282,7 +1582,10 @@ def _select_tweets(candidates: list[Tweet], ctx: QualityContext | None = None) -
 
     def pick(pool: list[Tweet]) -> None:  # cleanest first; among equals an unused format, then the model's order
         used = {c.style for c in chosen}
-        best = min(pool, key=lambda c: (problems(c), c.style in used, order[id(c)]))
+        firsts = Counter(_first_word(c.text) for c in chosen)
+        # Among equally clean candidates: varied first words (no third "Maybe…"), then varied formats, then model order.
+        best = min(pool, key=lambda c: (problems(c), firsts[_first_word(c.text)] >= MAX_SAME_FIRST_WORD,
+                                        c.style in used, order[id(c)]))
         chosen.append(best)
         taken.add(id(best))
 

@@ -178,4 +178,6 @@ def test_frontend_asks_the_server_questions_and_resends_answers():
     assert 'data-state="questions"' in html and 'id="voice-form"' in html
     assert 'body.detail.code === "voice_input_needed"' in js and "renderQuestions(body.detail)" in js
     assert "voice_preferences: voicePrefs" in js
-    assert '"Your chosen voice"' in js and '"From your answers"' in js  # never labelled as researched
+    review_js = (FRONTEND_DIR / "review.js").read_text(encoding="utf-8")  # the title now lives in Review.voiceTitle
+    assert '"Your chosen voice"' in review_js and "Review.voiceTitle(data, brand)" in js
+    assert '"From your answers"' in review_js and "Review.basisTagLabel(" in js  # never labelled as researched

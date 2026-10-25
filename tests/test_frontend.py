@@ -47,7 +47,8 @@ def test_review_assets_and_markup_present():
     assert html.index('src="review.js"') < html.index('src="app.js"')  # helpers load before the app
     for marker in ('class="needs-review"', 'id="review-note"', 'id="results-status"', "Needs review"):
         assert marker in html
-    assert "against your brief before publishing" in html
+    # The note covers both kinds of flag: unsupported claims and quality issues (e.g. a repeated idea).
+    assert "unsupported claim" in html and "quality issue" in html and "review" in html
 
 
 def test_research_backed_wording_is_gone():

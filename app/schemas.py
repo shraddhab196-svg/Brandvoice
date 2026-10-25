@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field, field_validator
 
 TWEET_COUNT = 10
 MAX_TWEET_CHARS = 280
+MIN_EXAMPLE_TWEETS, MAX_EXAMPLE_TWEETS = 3, 5
 
 # "evidence": backed by a quote verified against retrieved research text.
 # "inferred": derived from the user's brief only (no verified research evidence).
@@ -49,6 +50,32 @@ class TweetRequest(BaseModel):
     voice_preferences: VoicePreferences | None = Field(
         default=None, description="Optional. Your answers to the voice questions, sent after a 409 voice_input_needed "
                                   "response (no usable posts were found for the brand).")
+    example_tweets: list[str] | None = Field(
+        default=None, description=f"Optional. {MIN_EXAMPLE_TWEETS}-{MAX_EXAMPLE_TWEETS} real tweets written in your "
+                                  f"brand's voice (each up to {MAX_TWEET_CHARS} characters). Used to learn the style, "
+                                  "never copied, never treated as product facts.")
+
+    @field_validator("example_tweets", mode="before")
+    @classmethod
+    def clean_examples(cls, v: object) -> object:
+        if not isinstance(v, list):
+            return v
+        cleaned = [" ".join(x.split()) if isinstance(x, str) else x for x in v]
+        cleaned = [x for x in cleaned if x != ""]
+        return cleaned or None  # an empty list means "no examples"
+
+    @field_validator("example_tweets")
+    @classmethod
+    def check_examples(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return v
+        if not MIN_EXAMPLE_TWEETS <= len(v) <= MAX_EXAMPLE_TWEETS:
+            raise ValueError(f"provide {MIN_EXAMPLE_TWEETS}-{MAX_EXAMPLE_TWEETS} example tweets, or none")
+        if any(len(x) > MAX_TWEET_CHARS for x in v):
+            raise ValueError(f"each example tweet must be at most {MAX_TWEET_CHARS} characters")
+        if len({x.lower() for x in v}) != len(v):
+            raise ValueError("example tweets must be different from each other")
+        return v
 
     @field_validator("brand_name", "industry", mode="before")
     @classmethod
@@ -119,6 +146,12 @@ class VoiceProfile(BaseModel):
     writing_patterns: list[WritingPattern] = Field(min_length=2, max_length=4)
     themes: list[str] = Field(min_length=1, max_length=5)
     avoid: list[str] = Field(default_factory=list, max_length=5)
+    voice_confidence: Literal["high", "low", "none"] = Field(
+        default="none",
+        description='How much evidence there is of how this brand writes (computed, not model-reported): "high" = '
+                    'enough of the brand\'s own posts/example tweets and 2+ evidence-backed traits; "low" = some, but '
+                    'too few to be sure; "none" = no brand writing at all (the profile is a suggestion from your brief '
+                    "or your answers).")
 
 
 # ---------- Tweets ----------
@@ -148,9 +181,10 @@ class Tweet(BaseModel):
 
 class TweetResponse(BaseModel):
     brand_voice_summary: list[str] = Field(min_length=3, max_length=4)
-    voice_source: Literal["research", "user_preferences", "brief"] = Field(
+    voice_source: Literal["research", "user_examples", "user_preferences", "brief"] = Field(
         default="brief", description='Where the voice came from: "research" = the brand\'s own X posts; '
-                                     '"user_preferences" = your answers (not research); "brief" = inferred from your brief.')
+                                     '"user_examples" = your example tweets; "user_preferences" = your answers (not '
+                                     'research); "brief" = inferred from your brief.')
     voice_profile: VoiceProfile
     research: ResearchReport
     tweets: list[Tweet] = Field(min_length=TWEET_COUNT, max_length=TWEET_COUNT)

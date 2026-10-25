@@ -21,12 +21,24 @@ logger = logging.getLogger(__name__)
 SCRAPEBADGER_BASE = "https://scrapebadger.com/v1/twitter"
 FIRECRAWL_BASE = "https://api.firecrawl.dev/v2"
 
-MAX_POSTS = 8
+MAX_POSTS = 15
 MAX_POST_AGE_DAYS = 3 * 365  # older posts aren't the brand's current voice
 MIN_POST_CHARS = 15  # letters/digits (excluding links, hashtags, mentions) needed to show writing style
 MIN_ORIGINAL_POSTS = 3  # below this, the brand's own replies are used too
 LEADING_MENTIONS_RE = re.compile(r"^(?:@\w+\s*)+")
 HASHTAG_OR_MENTION_RE = re.compile(r"[#@]\w+")
+# Support/incident notices ("We're aware of login issues…", "thanks for your patience as we resolved an issue…"):
+# customer-service boilerplate, not the brand's social voice. Each phrase needs incident wording, so ordinary posts
+# (and jokes like "we're aware you skipped your lesson") aren't caught.
+NOTICE_RE = re.compile(
+    r"\b(?:aware of (?:\w+\s+){0,3}(?:issues?|problems?|outages?|bugs?|errors?|reports)"
+    r"|working (?:on|to) (?:fix|restore|resolve)\w*"
+    r"|thanks? (?:you )?for your patience (?:as|while) we"
+    r"|(?:resolved|fixed|investigating) (?:an?|the|this) (?:issue|problem|bug|outage|error)"
+    r"|issues? (?:affecting|with) (?:log ?ins?|logging in|sign[- ]?ins?|access|the app|our app|the site|our site)"
+    r"|experiencing (?:issues|problems|difficulties|an outage|downtime)"
+    r"|service (?:disruption|interruption)|scheduled maintenance|back up and running)\b",
+    re.IGNORECASE)
 # Website lines that quote customers/third parties ("“Love it!” — Sam") aren't the brand's own words.
 TESTIMONIAL_RE = re.compile(r"^\s*(?:[\"“‘'«★⭐]|>\s)|[”\"]\s*[—–-]{1,2}\s*\w")
 MIN_PAGE_TERMS = 5  # below this a scraped page has no readable content to judge
@@ -49,6 +61,8 @@ URL_RE = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
 BARE_DOMAIN_RE = re.compile(r"\b(?:www\.)?[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|io|ai|co|app|dev|org|net|in|so|xyz|shop|store)\b", re.IGNORECASE)
 X_PROFILE_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})\b", re.IGNORECASE)
 X_RESERVED_PATHS = {"home", "search", "explore", "intent", "share", "i", "hashtag", "settings"}
+# Sign-in/sign-up pages: no product information, never used as website evidence.
+AUTH_PATH_RE = re.compile(r"/(?:log-?in|sign-?in|sign-?up|register|auth|oauth|session)s?(?:/|$|\?)", re.IGNORECASE)
 
 
 MAX_SOURCE_EXCERPTS = 3
@@ -307,7 +321,7 @@ def _research_x(session: _Session, req: TweetRequest, settings: Settings) -> Non
     tier = "strong" if identity == "strong" else "uncertain"
     result.x_handle, result.posts, result.x_tier, result.x_user_supplied = handle, posts, tier, user_supplied
     if user.get("url") and identity == "strong":  # don't spend the website call on a possible lookalike's link
-        result.website_url = result.website_url or user["url"]
+        result.website_url = result.website_url or _homepage(user["url"])  # the homepage, not a deep/login link
 
 
 def _x_identity(user: dict, req: TweetRequest, user_supplied: bool) -> str:
@@ -410,9 +424,10 @@ def _clean_posts(tweets: list, handle: str = "") -> tuple[list[str], dict[str, i
     Kept: the account's own recent posts with enough words to show its writing. Original posts come first; the
     brand's own replies fill in when it has fewer than MIN_ORIGINAL_POSTS originals (reply-heavy brands still have a
     voice). Rejected, and counted by reason: retweets, posts by another author, posts older than MAX_POST_AGE_DAYS,
-    too-short/link-only posts, duplicates, malformed items. Returns (posts, stats, years of stale posts)."""
-    stats = {"fetched": 0, "kept": 0, "retweet": 0, "other_author": 0, "stale": 0, "too_short": 0, "duplicate": 0,
-             "malformed": 0, "replies_used": 0, "over_limit": 0}
+    support/incident notices, too-short/link-only posts, duplicates, malformed items.
+    Returns (posts, stats, years of stale posts)."""
+    stats = {"fetched": 0, "kept": 0, "retweet": 0, "other_author": 0, "stale": 0, "notice": 0, "too_short": 0,
+             "duplicate": 0, "malformed": 0, "replies_used": 0, "over_limit": 0}
     originals, replies, stale_years, seen = [], [], [], set()
     cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_POST_AGE_DAYS)
     for t in tweets:
@@ -434,6 +449,9 @@ def _clean_posts(tweets: list, handle: str = "") -> tuple[list[str], dict[str, i
             continue
         text = LEADING_MENTIONS_RE.sub("", URL_RE.sub("", t.get("full_text") or t.get("text") or ""))
         text = " ".join(text.split())
+        if NOTICE_RE.search(text.replace("’", "'")):
+            stats["notice"] += 1  # support boilerplate: not the brand's voice
+            continue
         if len(re.findall(r"[A-Za-z0-9]", HASHTAG_OR_MENTION_RE.sub("", text))) < MIN_POST_CHARS:
             stats["too_short"] += 1
             continue
@@ -487,7 +505,7 @@ def _format_stats(stats: dict[str, int]) -> str:
 
 def _format_rejections(stats: dict[str, int]) -> str:
     labels = {"retweet": "retweets", "other_author": "by other accounts", "stale": "older than 3 years",
-              "too_short": "too short", "duplicate": "duplicates", "malformed": "malformed",
+              "notice": "support notices", "too_short": "too short", "duplicate": "duplicates", "malformed": "malformed",
               "over_limit": "beyond the post limit"}
     return ", ".join(f"{stats[k]} {v}" for k, v in labels.items() if stats.get(k))
 
@@ -499,6 +517,8 @@ def _research_website(session: _Session, req: TweetRequest, settings: Settings) 
     # Priority: URL in the user's description > website on the matched X profile > search by brand name.
     # Each path is a single Firecrawl request, so the 1-call limit still yields page content.
     user_url = _find_website_in_text(req.description)
+    if user_url and _is_auth_page(user_url):
+        user_url = _homepage(user_url)  # a linked sign-in page -> that site's homepage
     url = user_url or session.result.website_url
     if url:
         data = _request_json(
@@ -528,9 +548,12 @@ def _search_website(session: _Session, req: TweetRequest, headers: dict) -> None
     )
     web = (data.get("data") or {}).get("web") if isinstance(data, dict) else None
     candidates = [item for item in web or [] if isinstance(item, dict) and isinstance(item.get("url"), str)
-                  and not _is_non_brand_domain(item["url"]) and brand in _domain_label(item["url"])]
-    # Prefer the brand's main site (duolingo.com) over its subdomains (schools.duolingo.com) and lookalikes.
-    candidates.sort(key=lambda item: (_site_label(item["url"]) != brand, _host(item["url"]).count(".")))
+                  and not _is_non_brand_domain(item["url"]) and brand in _domain_label(item["url"])
+                  and not _is_auth_page(item["url"])]
+    # Prefer the brand's main site (example.com) over its subdomains (shop.example.com) and lookalikes, and its
+    # homepage over deeper pages.
+    candidates.sort(key=lambda item: (_site_label(item["url"]) != brand, _host(item["url"]).count("."),
+                                      _path_depth(item["url"])))
     for item in candidates:
         if _apply_page(session.result, item, item["url"], req, user_supplied=False):
             return  # otherwise try the next candidate from the same response (no extra request)
@@ -547,6 +570,9 @@ def _apply_page(result: ResearchResult, page: dict, url: str, req: TweetRequest,
     if _is_non_brand_domain(final_url):
         if user_supplied:
             _exclude(result, label, req, reason="it isn't a brand-owned site")
+        return False
+    if _is_auth_page(final_url):  # e.g. the homepage redirected to a sign-in page: no product information
+        result.excluded.append(f"{label}: it led to a sign-in page, which has no product information, so it wasn't used.")
         return False
     text = _clean_markdown(page.get("markdown") or "")
     header = " — ".join(str(v) for v in (meta.get("title") or page.get("title"), meta.get("description") or page.get("description"))
@@ -651,11 +677,29 @@ def _domain_label(url: str) -> str:
 
 
 def _site_label(url: str) -> str:
-    """The registrable name: schools.duolingo.com -> "duolingo", shop.example.co.uk -> "example"."""
+    """The registrable name: shop.example.com -> "example", shop.example.co.uk -> "example"."""
     labels = _host(url).split(".")
     if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in ("co", "com", "org", "net", "ac", "gov"):
         return _norm(labels[-3])
     return _norm(labels[-2]) if len(labels) >= 2 else ""
+
+
+def _path_depth(url: str) -> int:
+    """0 for a homepage, 1 for /learn, 2 for /learn/spanish..."""
+    return len([p for p in urlparse(url if "://" in url else f"https://{url}").path.split("/") if p])
+
+
+def _is_auth_page(url: str) -> bool:
+    return bool(AUTH_PATH_RE.search(urlparse(url if "://" in url else f"https://{url}").path or ""))
+
+
+def _homepage(url: str) -> str:
+    """The site's homepage: deep links (often a logged-in area that redirects to a sign-in page) -> site root.
+    Shortener/social links are left alone (their destination isn't known yet)."""
+    if _is_non_brand_domain(url):
+        return url
+    parsed = urlparse(url if "://" in url else f"https://{url}")
+    return f"{parsed.scheme or 'https'}://{parsed.hostname}/" if parsed.hostname else url
 
 
 def _is_non_brand_domain(url: str) -> bool:
@@ -760,9 +804,16 @@ def _exclude(result: ResearchResult, what: str, req: TweetRequest, reason: str |
 
 
 def canonical_text(text: str) -> str:
-    """Typographic quotes -> plain, whitespace collapsed. Case and wording are preserved (exact matching)."""
+    """Typographic quotes and hyphen variants -> plain, whitespace collapsed. Case and wording are preserved (exact
+    matching). Only hyphens are normalised ("game‑like" with U+2011 == "game-like"); en/em dashes are punctuation."""
     text = text.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+    text = text.translate(HYPHEN_VARIANTS)
     return " ".join(text.split())
+
+
+# Hyphen look-alikes models emit (U+2010 hyphen, U+2011 non-breaking hyphen, U+2012 figure dash, U+2212 minus) -> "-";
+# soft hyphens (U+00AD) are dropped.
+HYPHEN_VARIANTS = {0x2010: "-", 0x2011: "-", 0x2012: "-", 0x2212: "-", 0x00AD: None}
 
 
 def _website_excerpts(text: str) -> list[str]:

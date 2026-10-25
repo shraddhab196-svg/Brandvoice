@@ -117,7 +117,7 @@ def test_successful_research_uses_cheap_lookup_and_cleans_content(monkeypatch):
     assert {r.url.host for r in router.requests} == {"scrapebadger.com", "api.firecrawl.dev"}
     assert router.requests[0].headers["x-api-key"] == SB_KEY
     assert router.requests[2].headers["authorization"] == f"Bearer {FC_KEY}"
-    assert json.loads(router.requests[2].content)["url"] == "https://moonbrew.com"
+    assert json.loads(router.requests[2].content)["url"] == "https://moonbrew.com/"  # the profile site's homepage
 
     prompt = result.to_prompt()
     assert "</brand_research>" not in prompt  # scraped text cannot close the prompt tag

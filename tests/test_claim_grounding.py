@@ -178,7 +178,8 @@ def test_ten_tweets_with_some_needing_review_and_shape_unchanged(monkeypatch):
     assert all(set(t) == set(Tweet.model_fields) for t in body["tweets"])
     flagged = [t for t in body["tweets"] if t["unverified_details"]]
     assert len(flagged) == 2 and all(t["basis"] == "inferred" for t in flagged)
-    assert fake.stages == ["analysis", "generation"]  # no repair call, no extra Groq usage
+    # Claim-flagged tweets get ONE bounded regeneration call (the fake returns the same candidates, so they stay flagged).
+    assert fake.stages == ["analysis", "generation", "generation"]
 
 
 def test_missing_brand_name_still_skips_scraping(monkeypatch):
